@@ -143,8 +143,13 @@ export function parseCommitData(data: Buffer): ParsedCommit {
   return { tree, parents, time };
 }
 
-export function parseTreeData(data: Buffer): TreeEntry[] {
-  const entries: TreeEntry[] = [];
+/** The target of an annotated tag object: { object } parsed from its header. */
+export function parseTagData(data: Buffer): { object: string } | null {
+  const match = /^object ([0-9a-f]{40})$/m.exec(data.toString('utf8'));
+  return match && match[1] ? { object: match[1] } : null;
+}
+
+export function parseTreeData(data: Buffer): TreeEntry[] {  const entries: TreeEntry[] = [];
   let pos = 0;
   while (pos < data.length) {
     const space = data.indexOf(0x20, pos);
@@ -499,6 +504,7 @@ export interface FetchRequest2 {
   /** Commit ids the client already holds as shallow boundary commits. */
   clientShallow: string[];
   depth?: number;
+  deepenRelative?: boolean;
   deepenSince?: number;
   deepenNot?: string[];
   /** Tag object ids advertised by refs; git follows tags into wanted history. */
@@ -530,10 +536,18 @@ export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan
     const parsed = store.commit(oid);
     if (parsed) for (const inner of store.treeClosure(parsed.tree)) haveSet.add(inner);
   };
-  for (const have of request.haves) {
-    if (!store.has(have)) continue;
-    if (clientShallowSet.has(have)) holdCommit(have);
-    else for (const oid of store.commitClosure(have)) holdCommit(oid);
+  // A have acknowledges its history only down to the client's shallow
+  // boundary: the boundary commit is held, its ancestors are not.
+  const heldCommits = new Set<string>();
+  const holdStack = [...request.haves];
+  while (holdStack.length) {
+    const oid = holdStack.pop() as string;
+    if (heldCommits.has(oid) || !store.has(oid)) continue;
+    heldCommits.add(oid);
+    holdCommit(oid);
+    if (clientShallowSet.has(oid)) continue;
+    const parsed = store.commit(oid);
+    if (parsed) for (const parent of parsed.parents) holdStack.push(parent);
   }
   for (const shallowOid of request.clientShallow) holdCommit(shallowOid);
 
@@ -553,7 +567,7 @@ export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan
     let cursor = want;
     while (store.get(cursor)?.type === 'tag') {
       wantedTags.add(cursor);
-      const parsedTag = parseTag((store.get(cursor) as GitObject).data);
+      const parsedTag = parseTagData((store.get(cursor) as GitObject).data);
       if (!parsedTag) {
         cursor = '';
         break;
@@ -569,43 +583,46 @@ export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan
   const included = new Set<string>();
   const boundary = new Set<string>();
   const since = request.deepenSince;
+  // Generations first (breadth-first, shortest distance from a want), then
+  // the inclusion cut. A relative deepen measures from the client's current
+  // boundary: the boundary commit's generation + 1 is the depth the client
+  // already has, and `depth` more generations are added to it.
   while (queue.length) {
     const oid = queue.shift() as string;
     const gen = generation.get(oid) as number;
     const parsed = store.commit(oid);
     if (!parsed) continue;
-    if (since !== undefined && included.size > 0 && parsed.time <= since && gen > 0) {
-      // Older than the deepen-since horizon: not included, not a boundary we
-      // name (its child already in the set carries the boundary).
-      continue;
-    }
-    included.add(oid);
-    let cut = false;
     for (const parent of parsed.parents) {
-      if (excluded.has(parent)) {
-        cut = true;
-        continue;
-      }
-      if (request.depth !== undefined && gen + 1 >= request.depth) {
-        cut = true;
-        continue;
-      }
-      const parentCommit = store.commit(parent);
-      if (!parentCommit) {
-        cut = true;
-        continue;
-      }
-      if (since !== undefined && parentCommit.time <= since) {
-        cut = true;
-        continue;
-      }
+      if (excluded.has(parent) || !store.commit(parent)) continue;
       if (!generation.has(parent)) {
         generation.set(parent, gen + 1);
         queue.push(parent);
       }
     }
-    if (cut && parsed.parents.length > 0) boundary.add(oid);
-    if (parsed.parents.length === 0) boundary.delete(oid);
+  }
+  let limit = request.depth === undefined ? Number.POSITIVE_INFINITY : request.depth;
+  if (request.deepenRelative && request.depth !== undefined) {
+    let boundaryGen = -1;
+    for (const oid of clientShallowSet) {
+      const gen = generation.get(oid);
+      if (gen !== undefined && gen > boundaryGen) boundaryGen = gen;
+    }
+    if (boundaryGen >= 0) limit = boundaryGen + 1 + request.depth;
+  }
+  for (const [oid, gen] of generation) {
+    const parsed = store.commit(oid);
+    if (!parsed) continue;
+    if (since !== undefined) {
+      if (gen > 0 && parsed.time <= since) continue;
+    } else if (gen >= limit) {
+      continue;
+    }
+    included.add(oid);
+  }
+  for (const oid of included) {
+    const parsed = store.commit(oid);
+    if (!parsed || parsed.parents.length === 0) continue;
+    if (parsed.parents.some((parent) => !included.has(parent))) boundary.add(oid);
   }
 
   const wantSet = new Set<string>();
@@ -625,7 +642,7 @@ export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan
     const chain: string[] = [];
     while (cursor && store.get(cursor)?.type === 'tag') {
       chain.push(cursor);
-      const parsedTag = parseTag(store.get(cursor)?.data ?? Buffer.alloc(0));
+      const parsedTag = parseTagData(store.get(cursor)?.data ?? Buffer.alloc(0));
       cursor = parsedTag ? parsedTag.object : null;
     }
     if (cursor && wantSet.has(cursor) && !haveSet.has(cursor)) {

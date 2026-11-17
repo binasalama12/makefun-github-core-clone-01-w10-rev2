@@ -638,6 +638,7 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
   const deepenNot: string[] = [];
   let depth: number | undefined;
   let deepenSince: number | undefined;
+  let deepenRelative = false;
   let done = false;
   for (const arg of args) {
     if (arg.startsWith('want ')) wants.push(arg.slice(5).trim());
@@ -646,11 +647,15 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
     else if (arg.startsWith('deepen-not ')) deepenNot.push(arg.slice('deepen-not '.length).trim());
     else if (arg.startsWith('deepen-since ')) deepenSince = Number(arg.slice('deepen-since '.length));
     else if (arg.startsWith('deepen ')) depth = Number(arg.slice(7));
+    else if (arg === 'deepen-relative') deepenRelative = true;
     else if (arg === 'done') done = true;
   }
   const parts: Buffer[] = [];
-  if (!done) {
-    // Negotiation step: acknowledge the haves we hold and offer readiness.
+  if (!done && wants.length) {
+    // A request without `done` still gets its pack in this response: the
+    // acknowledgments section (with `ready` when a have is common) is
+    // followed by the shallow-info and packfile sections, which is the
+    // sequence git's own reader expects after `ready`.
     parts.push(pktLine('acknowledgments\n'));
     let common = false;
     for (const have of haves) {
@@ -661,10 +666,9 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
     }
     if (!common) parts.push(pktLine('NAK\n'));
     else parts.push(pktLine('ready\n'));
-    parts.push(PKT_FLUSH);
-    return Buffer.concat(parts);
+    parts.push(PKT_DELIM);
   }
-  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenSince, deepenNot, followTags: tagRefOids(repo) });
+  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenRelative, deepenSince, deepenNot, followTags: tagRefOids(repo) });
   if (plan.shallow.length || plan.unshallow.length) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -690,6 +694,7 @@ function handleFetchV0(repo: Repo, lines: string[]): Buffer {
   const deepenNot: string[] = [];
   let depth: number | undefined;
   let deepenSince: number | undefined;
+  let deepenRelative = false;
   for (const arg of lines) {
     if (arg.startsWith('want ')) wants.push(arg.slice(5, 45));
     else if (arg.startsWith('have ')) haves.push(arg.slice(5, 45));
@@ -697,8 +702,9 @@ function handleFetchV0(repo: Repo, lines: string[]): Buffer {
     else if (arg.startsWith('deepen-not ')) deepenNot.push(arg.slice('deepen-not '.length).trim());
     else if (arg.startsWith('deepen-since ')) deepenSince = Number(arg.slice('deepen-since '.length));
     else if (arg.startsWith('deepen ')) depth = Number(arg.slice(7));
+    else if (arg === 'deepen-relative') deepenRelative = true;
   }
-  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenSince, deepenNot, followTags: tagRefOids(repo) });
+  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenRelative, deepenSince, deepenNot, followTags: tagRefOids(repo) });
   const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
@@ -977,12 +983,49 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
     }
   }
   if (tail[0] === 'git' && tail[1] === 'refs') {
+    if (method === 'POST' && tail.length === 2) {
+      const body = await readJsonBody(req);
+      if (!body.ok) return restError(res, 400, 'Problems parsing JSON');
+      const ref = str(body.value.ref);
+      const sha = str(body.value.sha);
+      if (!ref.startsWith('refs/') || !repo.store.has(sha)) return restError(res, 422, 'Validation Failed: ref and a known sha are required');
+      if (repo.refs.has(ref)) return restError(res, 422, 'Reference already exists');
+      repo.refs.set(ref, sha);
+      touchRefs(repo);
+      const obj = repo.store.get(sha);
+      return sendRest(res, 201, { ref, object: { sha, type: obj?.type ?? 'commit' } });
+    }
     const refName = tail.slice(2).join('/');
     if (method === 'GET') {
       const oid = repo.refs.get(`refs/${refName}`);
       if (!oid) return restError(res, 404, 'Not Found');
       const obj = repo.store.get(oid);
       return sendRest(res, 200, { ref: `refs/${refName}`, object: { sha: oid, type: obj?.type ?? 'commit' } });
+    }
+    if (method === 'PATCH') {
+      const body = await readJsonBody(req);
+      if (!body.ok) return restError(res, 400, 'Problems parsing JSON');
+      const full = `refs/${refName}`;
+      const current = repo.refs.get(full);
+      if (!current) return restError(res, 404, 'Not Found');
+      const sha = str(body.value.sha);
+      if (!repo.store.has(sha)) return restError(res, 422, 'Validation Failed: unknown sha');
+      if (body.value.force !== true && !repo.store.isAncestor(current, repo.store.peelToCommit(sha))) {
+        return restError(res, 422, 'Update is not a fast-forward');
+      }
+      repo.refs.set(full, sha);
+      touchRefs(repo);
+      const obj = repo.store.get(sha);
+      return sendRest(res, 200, { ref: full, object: { sha, type: obj?.type ?? 'commit' } });
+    }
+    if (method === 'DELETE') {
+      const full = `refs/${refName}`;
+      if (!repo.refs.has(full)) return restError(res, 404, 'Not Found');
+      repo.refs.delete(full);
+      touchRefs(repo);
+      res.writeHead(204, { 'X-GitHub-Request-Id': `ANVIL-${(requestCounter += 1)}` });
+      res.end();
+      return;
     }
   }
 
