@@ -313,7 +313,7 @@ function commitJson(repo: Repo, oid: string): Record<string, unknown> | null {
   const text = obj.data.toString('utf8');
   const splitAt = text.indexOf('\n\n');
   const header = splitAt >= 0 ? text.slice(0, splitAt) : text;
-  const message = splitAt >= 0 ? text.slice(splitAt + 2) : '';
+  const message = (splitAt >= 0 ? text.slice(splitAt + 2) : '').replace(/\n+$/, '');
   let authorName = USER_NAME;
   let authorEmail = USER_EMAIL;
   let authorDate = repo.createdAt;
