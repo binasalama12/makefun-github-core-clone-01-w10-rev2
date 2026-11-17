@@ -306,6 +306,116 @@ function computeMergeable(repo: Repo, pull: Pull): boolean {
   return true;
 }
 
+/** REST shape for one commit, parsed from the raw object. */
+function commitJson(repo: Repo, oid: string): Record<string, unknown> | null {
+  const obj = repo.store.get(oid);
+  if (!obj || obj.type !== 'commit') return null;
+  const text = obj.data.toString('utf8');
+  const splitAt = text.indexOf('\n\n');
+  const header = splitAt >= 0 ? text.slice(0, splitAt) : text;
+  const message = splitAt >= 0 ? text.slice(splitAt + 2) : '';
+  let authorName = USER_NAME;
+  let authorEmail = USER_EMAIL;
+  let authorDate = repo.createdAt;
+  const parents: Array<{ sha: string }> = [];
+  for (const line of header.split('\n')) {
+    if (line.startsWith('parent ')) parents.push({ sha: line.slice(7, 47) });
+    if (line.startsWith('author ')) {
+      const match = /^(.*) <(.*)> (\d+)/.exec(line.slice(7));
+      if (match) {
+        authorName = match[1] as string;
+        authorEmail = match[2] as string;
+        authorDate = new Date(Number(match[3]) * 1000).toISOString();
+      }
+    }
+  }
+  const person = { name: authorName, email: authorEmail, date: authorDate };
+  return {
+    sha: oid,
+    node_id: globalId('Commit', oid),
+    commit: { message, author: person, committer: person, tree: { sha: repo.store.commit(oid)?.tree ?? '' } },
+    author: { login: LOGIN, id: USER_ID },
+    committer: { login: LOGIN, id: USER_ID },
+    parents,
+  };
+}
+
+/** Commits reachable from `tip`, newest first. */
+function commitList(repo: Repo, tip: string, exclude: Set<string> = new Set()): Array<Record<string, unknown>> {
+  const seen = new Set<string>();
+  const rows: Array<{ oid: string; time: number }> = [];
+  const stack = [tip];
+  while (stack.length) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid) || exclude.has(oid)) continue;
+    seen.add(oid);
+    const parsed = repo.store.commit(oid);
+    if (!parsed) continue;
+    rows.push({ oid, time: parsed.time });
+    for (const parent of parsed.parents) stack.push(parent);
+  }
+  rows.sort((a, b) => b.time - a.time);
+  return rows.map((row) => commitJson(repo, row.oid)).filter((row) => row !== null) as Array<Record<string, unknown>>;
+}
+
+function textLines(text: string): string[] {
+  if (text === '') return [];
+  const lines = text.split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+/** Added/removed line counts between two texts (longest-common-subsequence). */
+function lineDiffCounts(oldText: string, newText: string): { additions: number; deletions: number } {
+  const a = textLines(oldText);
+  const b = textLines(newText);
+  if (a.length === 0) return { additions: b.length, deletions: 0 };
+  if (b.length === 0) return { additions: 0, deletions: a.length };
+  let prev = new Uint32Array(b.length + 1);
+  let curr = new Uint32Array(b.length + 1);
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      curr[j] = a[i - 1] === b[j - 1] ? (prev[j - 1] as number) + 1 : Math.max(prev[j] as number, curr[j - 1] as number);
+    }
+    [prev, curr] = [curr, prev];
+    curr.fill(0);
+  }
+  const common = prev[b.length] as number;
+  return { additions: b.length - common, deletions: a.length - common };
+}
+
+/** Files changed between the merge base of head/base and the head tip. */
+function pullFiles(repo: Repo, pull: Pull): Array<Record<string, unknown>> {
+  const headTip = refTip(repo, `refs/heads/${pull.headRef}`);
+  const baseTip = refTip(repo, `refs/heads/${pull.baseRef}`);
+  if (!headTip || !baseTip) return [];
+  const origin = mergeBase(repo.store, headTip, baseTip);
+  const originCommit = origin ? repo.store.commit(origin) : null;
+  const headCommit = repo.store.commit(headTip);
+  if (!headCommit) return [];
+  const before = flattenTree(repo.store, originCommit?.tree ?? '');
+  const after = flattenTree(repo.store, headCommit.tree);
+  const paths = new Set<string>([...before.keys(), ...after.keys()]);
+  const out: Array<Record<string, unknown>> = [];
+  for (const path of [...paths].sort()) {
+    const oldOid = before.get(path);
+    const newOid = after.get(path);
+    if (oldOid === newOid) continue;
+    const oldText = oldOid ? (repo.store.get(oldOid)?.data.toString('utf8') ?? '') : '';
+    const newText = newOid ? (repo.store.get(newOid)?.data.toString('utf8') ?? '') : '';
+    const { additions, deletions } = lineDiffCounts(oldText, newText);
+    out.push({
+      sha: newOid ?? oldOid ?? '',
+      filename: path,
+      status: oldOid === undefined ? 'added' : newOid === undefined ? 'removed' : 'modified',
+      additions,
+      deletions,
+      changes: additions + deletions,
+    });
+  }
+  return out;
+}
+
 /** The best common ancestor of two commits (breadth-first from both sides). */
 function mergeBase(store: ObjectStore, a: string, b: string): string | null {
   if (a === b) return a;
@@ -512,6 +622,15 @@ function handleLsRefs(repo: Repo, args: string[]): Buffer {
   return Buffer.concat(parts);
 }
 
+/** Tag object ids the repo's refs advertise (upload-pack follows them). */
+function tagRefOids(repo: Repo): string[] {
+  const out: string[] = [];
+  for (const oid of repo.refs.values()) {
+    if (repo.store.get(oid)?.type === 'tag') out.push(oid);
+  }
+  return out;
+}
+
 function handleFetchV2(repo: Repo, args: string[]): Buffer {
   const wants: string[] = [];
   const haves: string[] = [];
@@ -545,7 +664,7 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
     parts.push(PKT_FLUSH);
     return Buffer.concat(parts);
   }
-  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenSince, deepenNot });
+  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenSince, deepenNot, followTags: tagRefOids(repo) });
   if (plan.shallow.length || plan.unshallow.length) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -579,7 +698,7 @@ function handleFetchV0(repo: Repo, lines: string[]): Buffer {
     else if (arg.startsWith('deepen-since ')) deepenSince = Number(arg.slice('deepen-since '.length));
     else if (arg.startsWith('deepen ')) depth = Number(arg.slice(7));
   }
-  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenSince, deepenNot });
+  const plan = planFetch(repo.store, { wants, haves, clientShallow, depth, deepenSince, deepenNot, followTags: tagRefOids(repo) });
   const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
@@ -867,6 +986,27 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
     }
   }
 
+  // ---- commits
+  if (tail[0] === 'commits') {
+    if (method === 'GET' && tail.length === 1) {
+      const shaParam = strOr(url.searchParams.get('sha') ?? '', '');
+      let tip: string | null = null;
+      if (shaParam === '') tip = refTip(repo, headRef(repo));
+      else if (repo.store.commit(shaParam)) tip = shaParam;
+      else tip = refTip(repo, `refs/heads/${shaParam}`) ?? refTip(repo, shaParam);
+      if (!tip) return restError(res, 404, 'Not Found');
+      const { slice, headers } = pageSlice(commitList(repo, tip), url, req, `${repoPath}/commits`);
+      requestCounter += 1;
+      return sendJson(res, 200, slice, { 'X-GitHub-Request-Id': `ANVIL-${requestCounter}`, ...headers });
+    }
+    if (method === 'GET' && tail.length === 2) {
+      const one = commitJson(repo, tail[1] as string);
+      if (!one) return restError(res, 404, 'Not Found');
+      return sendRest(res, 200, one);
+    }
+    return restError(res, 404, 'Not Found');
+  }
+
   // ---- labels
   if (tail[0] === 'labels') {
     if (method === 'POST' && tail.length === 1) {
@@ -949,7 +1089,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
         touchRefs(repo);
         const name = path.split('/').pop() as string;
         return sendRest(res, existing ? 200 : 201, {
-          content: { name, path, sha: blobOid, size: content.length, type: 'file' },
+          content: { name, path, sha: blobOid, size: content.length, type: 'file', encoding: 'base64' },
           commit: { sha: commitOid, message: strOr(body.value.message, `Update ${path}`) },
         });
       }
@@ -976,7 +1116,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
       let list = [...repo.issues.values()];
       if (state === 'open') list = list.filter((issue) => issue.state === 'open');
       else if (state === 'closed') list = list.filter((issue) => issue.state === 'closed');
-      list.sort((a, b) => b.number - a.number);
+      const ascending = url.searchParams.get('direction') === 'asc';
+      list.sort((a, b) => (ascending ? a.number - b.number : b.number - a.number));
       const { slice, headers } = pageSlice(list, url, req, `${repoPath}/issues`);
       requestCounter += 1;
       return sendJson(res, 200, slice.map((issue) => issueJson(repo, issue, req)), { 'X-GitHub-Request-Id': `ANVIL-${requestCounter}`, ...headers });
@@ -1053,7 +1194,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
       let list = [...repo.pulls.values()];
       if (state === 'open') list = list.filter((pull) => pull.state === 'open');
       else if (state === 'closed') list = list.filter((pull) => pull.state !== 'open');
-      list.sort((a, b) => b.number - a.number);
+      const ascending = url.searchParams.get('direction') === 'asc';
+      list.sort((a, b) => (ascending ? a.number - b.number : b.number - a.number));
       return sendRest(res, 200, list.map((pull) => pullJson(repo, pull, req)));
     }
     if (tail.length === 1 && method === 'POST') {
@@ -1083,6 +1225,18 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
         pull.updatedAt = nowIso();
         return sendRest(res, 200, pullJson(repo, pull, req));
       }
+    }
+    if (tail.length === 3 && tail[2] === 'commits' && method === 'GET') {
+      if (!pull) return restError(res, 404, 'Not Found');
+      const headTip = refTip(repo, `refs/heads/${pull.headRef}`);
+      const baseTip = refTip(repo, `refs/heads/${pull.baseRef}`);
+      if (!headTip) return restError(res, 404, 'Not Found');
+      const exclude = new Set<string>(baseTip ? repo.store.commitClosure(baseTip) : []);
+      return sendRest(res, 200, commitList(repo, headTip, exclude));
+    }
+    if (tail.length === 3 && tail[2] === 'files' && method === 'GET') {
+      if (!pull) return restError(res, 404, 'Not Found');
+      return sendRest(res, 200, pullFiles(repo, pull));
     }
     if (tail.length === 3 && tail[2] === 'merge' && method === 'PUT') {
       if (!pull) return restError(res, 404, 'Not Found');

@@ -501,6 +501,8 @@ export interface FetchRequest2 {
   depth?: number;
   deepenSince?: number;
   deepenNot?: string[];
+  /** Tag object ids advertised by refs; git follows tags into wanted history. */
+  followTags?: string[];
 }
 
 export interface FetchPlan {
@@ -518,17 +520,22 @@ export interface FetchPlan {
  * commit the client named and that commit's own tree closure).
  */
 export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan {
+  // What the client provably holds. A have that is also a shallow boundary
+  // acknowledges only that commit and its tree closure — the client does NOT
+  // hold its ancestors. Any other have acknowledges its whole history.
+  const clientShallowSet = new Set(request.clientShallow);
   const haveSet = new Set<string>();
+  const holdCommit = (oid: string): void => {
+    haveSet.add(oid);
+    const parsed = store.commit(oid);
+    if (parsed) for (const inner of store.treeClosure(parsed.tree)) haveSet.add(inner);
+  };
   for (const have of request.haves) {
     if (!store.has(have)) continue;
-    for (const oid of store.commitClosure(have)) haveSet.add(oid);
+    if (clientShallowSet.has(have)) holdCommit(have);
+    else for (const oid of store.commitClosure(have)) holdCommit(oid);
   }
-  for (const shallowOid of request.clientShallow) {
-    const parsed = store.commit(shallowOid);
-    if (!parsed) continue;
-    haveSet.add(shallowOid);
-    for (const oid of store.treeClosure(parsed.tree)) haveSet.add(oid);
-  }
+  for (const shallowOid of request.clientShallow) holdCommit(shallowOid);
 
   const excluded = new Set<string>();
   for (const not of request.deepenNot ?? []) {
@@ -537,13 +544,26 @@ export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan
   }
 
   // Breadth-first by generation so a depth limit cuts evenly on every path.
+  // A want that names a tag object delivers the tag itself plus its target.
   const generation = new Map<string, number>();
   const queue: string[] = [];
+  const wantedTags = new Set<string>();
   for (const want of request.wants) {
     if (!store.has(want) || excluded.has(want)) continue;
-    if (!generation.has(want)) {
-      generation.set(want, 0);
-      queue.push(want);
+    let cursor = want;
+    while (store.get(cursor)?.type === 'tag') {
+      wantedTags.add(cursor);
+      const parsedTag = parseTag((store.get(cursor) as GitObject).data);
+      if (!parsedTag) {
+        cursor = '';
+        break;
+      }
+      cursor = parsedTag.object;
+    }
+    if (!cursor || !store.commit(cursor)) continue;
+    if (!generation.has(cursor)) {
+      generation.set(cursor, 0);
+      queue.push(cursor);
     }
   }
   const included = new Set<string>();
@@ -598,6 +618,21 @@ export function planFetch(store: ObjectStore, request: FetchRequest2): FetchPlan
 
   const objects: string[] = [];
   for (const oid of wantSet) if (!haveSet.has(oid)) objects.push(oid);
+  // Tag following: a tag ref whose target commit is in the delivered set
+  // travels with the pack, exactly as upload-pack sends it.
+  for (const tagOid of request.followTags ?? []) {
+    let cursor: string | null = tagOid;
+    const chain: string[] = [];
+    while (cursor && store.get(cursor)?.type === 'tag') {
+      chain.push(cursor);
+      const parsedTag = parseTag(store.get(cursor)?.data ?? Buffer.alloc(0));
+      cursor = parsedTag ? parsedTag.object : null;
+    }
+    if (cursor && wantSet.has(cursor) && !haveSet.has(cursor)) {
+      for (const oid of chain) if (!haveSet.has(oid) && !objects.includes(oid)) objects.push(oid);
+    }
+  }
+  for (const oid of wantedTags) if (!haveSet.has(oid) && !objects.includes(oid)) objects.push(oid);
   // Tips first keeps the pack friendly to stream readers; order is not scored.
   objects.sort((a, b) => (request.wants.includes(a) ? 0 : 1) - (request.wants.includes(b) ? 0 : 1));
 
